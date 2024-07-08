@@ -43,7 +43,7 @@ void SerializedRequest::SharedDtor() {
 }
 
 void SerializedRequest::SetCachedSize(int /*size*/) const {
-    CHECK(false) << "You're not supposed to call " << __FUNCTION__;
+    CHECK(false) << "You're not supposed to call " << __func__;
 }
 const ::google::protobuf::Descriptor* SerializedRequest::descriptor() {
     return SerializedRequestBase::descriptor();

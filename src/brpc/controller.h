@@ -46,6 +46,7 @@
 #include "brpc/progressive_reader.h"           // ProgressiveReader
 #include "brpc/grpc.h"
 #include "brpc/kvmap.h"
+#include "brpc/rpc_dump.h"
 
 // EAUTH is defined in MAC
 #ifndef EAUTH
@@ -68,7 +69,6 @@ class SharedLoadBalancer;
 class ExcludedServers;
 class RPCSender;
 class StreamSettings;
-class SampledRequest;
 class MongoContext;
 class RetryPolicy;
 class InputMessageBase;
@@ -104,6 +104,8 @@ enum StopStyle {
 };
 
 const int32_t UNSET_MAGIC_NUM = -123456789;
+
+typedef butil::FlatMap<std::string, std::string> UserFieldsMap;
 
 // A Controller mediates a single method call. The primary purpose of
 // the controller is to provide a way to manipulate settings per RPC-call 
@@ -255,6 +257,26 @@ public:
         return tmp;
     }
 
+    UserFieldsMap* request_user_fields() {
+        if (!_request_user_fields) {
+            _request_user_fields = new UserFieldsMap;
+            _request_user_fields->init(29);
+        }
+        return _request_user_fields;
+    }
+
+    bool has_request_user_fields() const { return _request_user_fields; }
+
+    UserFieldsMap* response_user_fields() {
+        if (!_response_user_fields) {
+            _response_user_fields = new UserFieldsMap;
+            _response_user_fields->init(29);
+        }
+        return _response_user_fields;
+    }
+
+    bool has_response_user_fields() const { return _response_user_fields; }
+
     // User attached data or body of http request, which is wired to network
     // directly instead of being serialized into protobuf messages.
     butil::IOBuf& request_attachment() { return _request_attachment; }
@@ -283,7 +305,9 @@ public:
     // Get/own SampledRequest for sending dumped requests.
     // Deleted along with controller.
     void reset_sampled_request(SampledRequest* req);
-    const SampledRequest* sampled_request() { return _sampled_request; }
+    const SampledRequest* sampled_request() const { return _sampled_request; }
+    SampledRequest* release_sampled_request();
+
 
     // Attach a StreamCreator to this RPC. Notice that the ownership of sc has
     // been transferred to cntl, and sc->DestroyStreamCreator() would be called
@@ -819,6 +843,10 @@ private:
 
     HttpHeader* _http_request;
     HttpHeader* _http_response;
+
+    // User fields of baidu_std protocol.
+    UserFieldsMap* _request_user_fields;
+    UserFieldsMap* _response_user_fields;
 
     std::unique_ptr<KVMap> _session_kv;
 

@@ -46,11 +46,14 @@
 extern "C" {
 extern void* __attribute__((weak)) _dl_sym(void* handle, const char* symbol, void* caller);
 }
+extern int __attribute__((weak)) GetStackTrace(void** result, int max_depth, int skip_count);
 
 namespace bthread {
 // Warm up backtrace before main().
 void* dummy_buf[4];
-const int ALLOW_UNUSED dummy_bt = backtrace(dummy_buf, arraysize(dummy_buf));
+const int ALLOW_UNUSED dummy_bt = GetStackTrace
+    ? GetStackTrace(dummy_buf, arraysize(dummy_buf), 0)
+    : backtrace(dummy_buf, arraysize(dummy_buf));
 
 // For controlling contentions collected per second.
 static bvar::CollectorSpeedLimit g_cp_sl = BVAR_COLLECTOR_SPEED_LIMIT_INITIALIZER;
@@ -64,24 +67,32 @@ struct SampledContention : public bvar::Collected {
     int64_t duration_ns;
     // number of samples, normalized according to to sampling_range
     double count;
-    int nframes;          // #elements in stack
     void* stack[26];      // backtrace.
+    int nframes;          // #elements in stack
 
     // Implement bvar::Collected
     void dump_and_destroy(size_t round) override;
     void destroy() override;
     bvar::CollectorSpeedLimit* speed_limit() override { return &g_cp_sl; }
 
-    // For combining samples with hashmap.
     size_t hash_code() const {
         if (nframes == 0) {
             return 0;
         }
-        uint32_t code = 1;
-        uint32_t seed = nframes;
-        butil::MurmurHash3_x86_32(stack, sizeof(void*) * nframes, seed, &code);
-        return code;
+        if (_hash_code == 0) {
+            _hash_code = 1;
+            uint32_t seed = nframes;
+            butil::MurmurHash3_x86_32(stack, sizeof(void*) * nframes, seed, &_hash_code);
+        }
+        return _hash_code;
     }
+private:
+friend butil::ObjectPool<SampledContention>;
+    SampledContention()
+        : duration_ns(0), count(0), stack{NULL}, nframes(0), _hash_code(0) {}
+    ~SampledContention() override = default;
+
+    mutable uint32_t _hash_code; // For combining samples with hashmap.
 };
 
 BAIDU_CASSERT(sizeof(SampledContention) == 256, be_friendly_to_allocator);
@@ -257,7 +268,7 @@ BAIDU_CACHELINE_ALIGNMENT static ContentionProfiler* g_cp = NULL;
 // Need this version to solve an issue that non-empty entries left by
 // previous contention profilers should be detected and overwritten.
 static uint64_t g_cp_version = 0;
-// Protecting accesss to g_cp.
+// Protecting accesses to g_cp.
 static pthread_mutex_t g_cp_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // The map storing information for profiling pthread_mutex. Different from
@@ -294,6 +305,7 @@ void SampledContention::dump_and_destroy(size_t /*round*/) {
 }
 
 void SampledContention::destroy() {
+    _hash_code = 0;
     butil::return_object(this);
 }
 
@@ -436,7 +448,8 @@ int first_sys_pthread_mutex_unlock(pthread_mutex_t* mutex) {
     return sys_pthread_mutex_unlock(mutex);
 }
 
-inline uint64_t hash_mutex_ptr(const pthread_mutex_t* m) {
+template <typename Mutex>
+inline uint64_t hash_mutex_ptr(const Mutex* m) {
     return butil::fmix64((uint64_t)m);
 }
 
@@ -456,7 +469,7 @@ static __thread bool tls_inside_lock = false;
 #ifndef DONT_SPEEDUP_PTHREAD_CONTENTION_PROFILER_WITH_TLS
 const int TLS_MAX_COUNT = 3;
 struct MutexAndContentionSite {
-    pthread_mutex_t* mutex;
+    void* mutex;
     bthread_contention_site_t csite;
 };
 struct TLSPthreadContentionSites {
@@ -470,8 +483,9 @@ static __thread TLSPthreadContentionSites tls_csites = {0,0,{}};
 // Guaranteed in linux/win.
 const int PTR_BITS = 48;
 
+template <typename Mutex>
 inline bthread_contention_site_t*
-add_pthread_contention_site(pthread_mutex_t* mutex) {
+add_pthread_contention_site(const Mutex* mutex) {
     MutexMapEntry& entry = g_mutex_map[hash_mutex_ptr(mutex) & (MUTEX_MAP_SIZE - 1)];
     butil::static_atomic<uint64_t>& m = entry.versioned_mutex;
     uint64_t expected = m.load(butil::memory_order_relaxed);
@@ -488,8 +502,9 @@ add_pthread_contention_site(pthread_mutex_t* mutex) {
     return NULL;
 }
 
-inline bool remove_pthread_contention_site(
-    pthread_mutex_t* mutex, bthread_contention_site_t* saved_csite) {
+template <typename Mutex>
+inline bool remove_pthread_contention_site(const Mutex* mutex,
+                                           bthread_contention_site_t* saved_csite) {
     MutexMapEntry& entry = g_mutex_map[hash_mutex_ptr(mutex) & (MUTEX_MAP_SIZE - 1)];
     butil::static_atomic<uint64_t>& m = entry.versioned_mutex;
     if ((m.load(butil::memory_order_relaxed) & ((((uint64_t)1) << PTR_BITS) - 1))
@@ -512,28 +527,58 @@ inline bool remove_pthread_contention_site(
 // Submit the contention along with the callsite('s stacktrace)
 void submit_contention(const bthread_contention_site_t& csite, int64_t now_ns) {
     tls_inside_lock = true;
-    SampledContention* sc = butil::get_object<SampledContention>();
+    auto sc = butil::get_object<SampledContention>();
     // Normalize duration_us and count so that they're addable in later
     // processings. Notice that sampling_range is adjusted periodically by
     // collecting thread.
     sc->duration_ns = csite.duration_ns * bvar::COLLECTOR_SAMPLING_BASE
         / csite.sampling_range;
     sc->count = bvar::COLLECTOR_SAMPLING_BASE / (double)csite.sampling_range;
-    sc->nframes = backtrace(sc->stack, arraysize(sc->stack)); // may lock
+    sc->nframes = GetStackTrace
+        ? GetStackTrace(sc->stack, arraysize(sc->stack), 0)
+        : backtrace(sc->stack, arraysize(sc->stack)); // may lock
     sc->submit(now_ns / 1000);  // may lock
     tls_inside_lock = false;
 }
 
-BUTIL_FORCE_INLINE int pthread_mutex_lock_impl(pthread_mutex_t* mutex) {
+namespace internal {
+BUTIL_FORCE_INLINE int pthread_mutex_lock_internal(pthread_mutex_t* mutex) {
+    return sys_pthread_mutex_lock(mutex);
+}
+
+BUTIL_FORCE_INLINE int pthread_mutex_trylock_internal(pthread_mutex_t* mutex) {
+    return ::pthread_mutex_trylock(mutex);
+}
+
+BUTIL_FORCE_INLINE int pthread_mutex_unlock_internal(pthread_mutex_t* mutex) {
+    return sys_pthread_mutex_unlock(mutex);
+}
+
+BUTIL_FORCE_INLINE int pthread_mutex_lock_internal(FastPthreadMutex* mutex) {
+    mutex->lock();
+    return 0;
+}
+
+BUTIL_FORCE_INLINE int pthread_mutex_trylock_internal(FastPthreadMutex* mutex) {
+    return mutex->try_lock() ? 0 : EBUSY;
+}
+
+BUTIL_FORCE_INLINE int pthread_mutex_unlock_internal(FastPthreadMutex* mutex) {
+    mutex->unlock();
+    return 0;
+}
+
+template <typename Mutex>
+BUTIL_FORCE_INLINE int pthread_mutex_lock_impl(Mutex* mutex) {
     // Don't change behavior of lock when profiler is off.
     if (!g_cp ||
         // collecting code including backtrace() and submit() may call
         // pthread_mutex_lock and cause deadlock. Don't sample.
         tls_inside_lock) {
-        return sys_pthread_mutex_lock(mutex);
+        return pthread_mutex_lock_internal(mutex);
     }
     // Don't slow down non-contended locks.
-    int rc = pthread_mutex_trylock(mutex);
+    int rc = pthread_mutex_trylock_internal(mutex);
     if (rc != EBUSY) {
         return rc;
     }
@@ -553,16 +598,16 @@ BUTIL_FORCE_INLINE int pthread_mutex_lock_impl(pthread_mutex_t* mutex) {
         csite = &entry.csite;
         if (!sampling_range) {
             make_contention_site_invalid(&entry.csite);
-            return sys_pthread_mutex_lock(mutex);
+            return pthread_mutex_lock_internal(mutex);
         }
     }
 #endif
     if (!sampling_range) {  // don't sample
-        return sys_pthread_mutex_lock(mutex);
+        return pthread_mutex_lock_internal(mutex);
     }
     // Lock and monitor the waiting time.
     const int64_t start_ns = butil::cpuwide_time_ns();
-    rc = sys_pthread_mutex_lock(mutex);
+    rc = pthread_mutex_lock_internal(mutex);
     if (!rc) { // Inside lock
         if (!csite) {
             csite = add_pthread_contention_site(mutex);
@@ -576,13 +621,14 @@ BUTIL_FORCE_INLINE int pthread_mutex_lock_impl(pthread_mutex_t* mutex) {
     return rc;
 }
 
-BUTIL_FORCE_INLINE int pthread_mutex_unlock_impl(pthread_mutex_t* mutex) {
+template <typename Mutex>
+BUTIL_FORCE_INLINE int pthread_mutex_unlock_impl(Mutex* mutex) {
     // Don't change behavior of unlock when profiler is off.
     if (!g_cp || tls_inside_lock) {
         // This branch brings an issue that an entry created by
-        // add_pthread_contention_site may not be cleared. Thus we add a 
+        // add_pthread_contention_site may not be cleared. Thus we add a
         // 16-bit rolling version in the entry to find out such entry.
-        return sys_pthread_mutex_unlock(mutex);
+        return pthread_mutex_unlock_internal(mutex);
     }
     int64_t unlock_start_ns = 0;
     bool miss_in_tls = true;
@@ -608,7 +654,7 @@ BUTIL_FORCE_INLINE int pthread_mutex_unlock_impl(pthread_mutex_t* mutex) {
             unlock_start_ns = butil::cpuwide_time_ns();
         }
     }
-    const int rc = sys_pthread_mutex_unlock(mutex);
+    const int rc = pthread_mutex_unlock_internal(mutex);
     // [Outside lock]
     if (unlock_start_ns) {
         const int64_t unlock_end_ns = butil::cpuwide_time_ns();
@@ -616,6 +662,16 @@ BUTIL_FORCE_INLINE int pthread_mutex_unlock_impl(pthread_mutex_t* mutex) {
         submit_contention(saved_csite, unlock_end_ns);
     }
     return rc;
+}
+
+}
+
+BUTIL_FORCE_INLINE int pthread_mutex_lock_impl(pthread_mutex_t* mutex) {
+    return internal::pthread_mutex_lock_impl(mutex);
+}
+
+BUTIL_FORCE_INLINE int pthread_mutex_unlock_impl(pthread_mutex_t* mutex) {
+    return internal::pthread_mutex_unlock_impl(mutex);
 }
 
 // Implement bthread_mutex_t related functions
@@ -699,6 +755,14 @@ void FastPthreadMutex::unlock() {
 
 } // namespace internal
 #endif // BTHREAD_USE_FAST_PTHREAD_MUTEX
+
+void FastPthreadMutex::lock() {
+    internal::pthread_mutex_lock_impl(&_mutex);
+}
+
+void FastPthreadMutex::unlock() {
+    internal::pthread_mutex_unlock_impl(&_mutex);
+}
 
 } // namespace bthread
 

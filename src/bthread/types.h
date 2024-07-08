@@ -32,6 +32,11 @@ typedef uint64_t bthread_t;
 // tid returned by bthread_start_* never equals this value.
 static const bthread_t INVALID_BTHREAD = 0;
 
+// bthread tag default is 0
+typedef int bthread_tag_t;
+static const bthread_tag_t BTHREAD_TAG_INVALID = -1;
+static const bthread_tag_t BTHREAD_TAG_DEFAULT = 0;
+
 struct sockaddr;
 
 typedef unsigned bthread_stacktype_t;
@@ -79,7 +84,8 @@ inline std::ostream& operator<<(std::ostream& os, bthread_key_t key) {
 #endif  // __cplusplus
 
 typedef struct {
-    pthread_mutex_t mutex;
+    pthread_rwlock_t rwlock;
+    void* list;
     void* free_keytables;
     int destroyed;
 } bthread_keytable_pool_t;
@@ -93,12 +99,14 @@ typedef struct bthread_attr_t {
     bthread_stacktype_t stack_type;
     bthread_attrflags_t flags;
     bthread_keytable_pool_t* keytable_pool;
+    bthread_tag_t tag;
 
 #if defined(__cplusplus)
     void operator=(unsigned stacktype_and_flags) {
         stack_type = (stacktype_and_flags & 7);
         flags = (stacktype_and_flags & ~(unsigned)7u);
         keytable_pool = NULL;
+        tag = BTHREAD_TAG_INVALID;
     }
     bthread_attr_t operator|(unsigned other_flags) const {
         CHECK(!(other_flags & 7)) << "flags=" << other_flags;
@@ -116,24 +124,22 @@ typedef struct bthread_attr_t {
 // obvious drawback is that you need more worker pthreads when you have a lot
 // of such bthreads.
 static const bthread_attr_t BTHREAD_ATTR_PTHREAD =
-{ BTHREAD_STACKTYPE_PTHREAD, 0, NULL };
+{ BTHREAD_STACKTYPE_PTHREAD, 0, NULL, BTHREAD_TAG_INVALID };
 
 // bthreads created with following attributes will have different size of
 // stacks. Default is BTHREAD_ATTR_NORMAL.
-static const bthread_attr_t BTHREAD_ATTR_SMALL =
-{ BTHREAD_STACKTYPE_SMALL, 0, NULL };
-static const bthread_attr_t BTHREAD_ATTR_NORMAL =
-{ BTHREAD_STACKTYPE_NORMAL, 0, NULL };
-static const bthread_attr_t BTHREAD_ATTR_LARGE =
-{ BTHREAD_STACKTYPE_LARGE, 0, NULL };
+static const bthread_attr_t BTHREAD_ATTR_SMALL = {BTHREAD_STACKTYPE_SMALL, 0, NULL,
+                                                  BTHREAD_TAG_INVALID};
+static const bthread_attr_t BTHREAD_ATTR_NORMAL = {BTHREAD_STACKTYPE_NORMAL, 0, NULL,
+                                                   BTHREAD_TAG_INVALID};
+static const bthread_attr_t BTHREAD_ATTR_LARGE = {BTHREAD_STACKTYPE_LARGE, 0, NULL,
+                                                  BTHREAD_TAG_INVALID};
 
 // bthreads created with this attribute will print log when it's started,
 // context-switched, finished.
 static const bthread_attr_t BTHREAD_ATTR_DEBUG = {
-    BTHREAD_STACKTYPE_NORMAL,
-    BTHREAD_LOG_START_AND_FINISH | BTHREAD_LOG_CONTEXT_SWITCH,
-    NULL
-};
+    BTHREAD_STACKTYPE_NORMAL, BTHREAD_LOG_START_AND_FINISH | BTHREAD_LOG_CONTEXT_SWITCH, NULL,
+    BTHREAD_TAG_INVALID};
 
 static const size_t BTHREAD_EPOLL_THREAD_NUM = 1;
 static const bthread_t BTHREAD_ATOMIC_INIT = 0;
@@ -186,6 +192,29 @@ typedef struct {
 
 typedef struct {
 } bthread_barrierattr_t;
+
+#if defined(__cplusplus)
+class bthread_once_t;
+namespace bthread {
+extern int bthread_once_impl(bthread_once_t* once_control, void (*init_routine)());
+}
+
+class bthread_once_t {
+public:
+friend int bthread::bthread_once_impl(bthread_once_t* once_control, void (*init_routine)());
+    enum State {
+        UNINITIALIZED = 0,
+        INPROGRESS,
+        INITIALIZED,
+    };
+
+    bthread_once_t();
+    ~bthread_once_t();
+
+private:
+    butil::atomic<int>* _butex;
+};
+#endif
 
 typedef struct {
     uint64_t value;

@@ -173,7 +173,7 @@ public:
 
     // Wake up blocking ops in the thread.
     // Returns 0 on success, errno otherwise.
-    static int interrupt(bthread_t tid, TaskControl* c);
+    static int interrupt(bthread_t tid, TaskControl* c, bthread_tag_t tag);
 
     // Get the meta associate with the task.
     static TaskMeta* address_meta(bthread_t tid);
@@ -181,6 +181,8 @@ public:
     // Push a task into _rq, if _rq is full, retry after some time. This
     // process make go on indefinitely.
     void push_rq(bthread_t tid);
+
+    bthread_tag_t tag() const { return _tag; }
 
 private:
 friend class TaskControl;
@@ -221,6 +223,10 @@ friend class TaskControl;
         return _control->steal_task(tid, &_steal_seed, _steal_offset);
     }
 
+    void set_tag(bthread_tag_t tag) { _tag = tag; }
+
+    void set_pl(ParkingLot* pl) { _pl = pl; }
+
     TaskMeta* _cur_meta;
     
     // the control that this group belongs to
@@ -249,6 +255,8 @@ friend class TaskControl;
     int _remote_nsignaled;
 
     int _sched_recursive_guard;
+    // tag of this taskgroup
+    bthread_tag_t _tag;
 };
 
 }  // namespace bthread

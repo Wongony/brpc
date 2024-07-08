@@ -248,7 +248,8 @@ master HEAD已支持M1系列芯片，M2未测试过。欢迎通过issues向我�
 
 安装依赖：
 ```shell
-brew install openssl git gnu-getopt coreutils gflags protobuf leveldb
+brew install ./homebrew-formula/protobuf.rb
+brew install openssl git gnu-getopt coreutils gflags leveldb
 ```
 
 如果你要在样例中启用cpu/heap的profiler：
@@ -340,11 +341,9 @@ GCC7中over-aligned的问题暂时被禁止。
 
 无已知问题。
 
-## protobuf: 2.4+
+## protobuf: 3.0-3.25
 
-同一个文件兼容pb 3.x版本和pb 2.x版本：
-不要使用proto3新增的类型，并且在proto文件的起始位置添加`syntax=proto2;`声明。
-[tools/add_syntax_equal_proto2_to_all.sh](https://github.com/apache/brpc/blob/master/tools/add_syntax_equal_proto2_to_all.sh)这个脚本可以给所有没有这行声明的proto文件添加`syntax="proto2"`声明。
+[1.8.0版本](https://github.com/apache/brpc/releases/tag/1.8.0)中[#2406](https://github.com/apache/brpc/pull/2406)和[#2493](https://github.com/apache/brpc/pull/2493)引入了部分proto3语法，所以目前bRPC不再兼容pb 2.x版本。如果你希望使用pb 2.x版本，可以使用1.8.0之前的bRPC版本。
 
 pb 3.x中的Arena至今没被支持。
 

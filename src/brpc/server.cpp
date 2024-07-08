@@ -45,6 +45,7 @@
 #include "brpc/builtin/bad_method_service.h"   // BadMethodService
 #include "brpc/builtin/get_favicon_service.h"
 #include "brpc/builtin/get_js_service.h"
+#include "brpc/builtin/grpc_health_check_service.h"  // GrpcHealthCheckService
 #include "brpc/builtin/version_service.h"
 #include "brpc/builtin/health_service.h"
 #include "brpc/builtin/list_service.h"
@@ -64,6 +65,7 @@
 #include "brpc/builtin/sockets_service.h"      // SocketsService
 #include "brpc/builtin/hotspots_service.h"     // HotspotsService
 #include "brpc/builtin/prometheus_metrics_service.h"
+#include "brpc/builtin/memory_service.h"
 #include "brpc/details/method_status.h"
 #include "brpc/load_balancer.h"
 #include "brpc/naming_service.h"
@@ -75,6 +77,7 @@
 #include "brpc/builtin/common.h"               // GetProgramName
 #include "brpc/details/tcmalloc_extension.h"
 #include "brpc/rdma/rdma_helper.h"
+#include "brpc/baidu_master_service.h"
 
 inline std::ostream& operator<<(std::ostream& os, const timeval& tm) {
     const char old_fill = os.fill();
@@ -86,6 +89,8 @@ inline std::ostream& operator<<(std::ostream& os, const timeval& tm) {
 extern "C" {
 void* bthread_get_assigned_data();
 }
+
+DECLARE_int32(task_group_ntags);
 
 namespace brpc {
 
@@ -141,10 +146,12 @@ ServerOptions::ServerOptions()
     , has_builtin_services(true)
     , force_ssl(false)
     , use_rdma(false)
+    , baidu_master_service(NULL)
     , http_master_service(NULL)
     , health_reporter(NULL)
     , rtmp_service(NULL)
-    , redis_service(NULL) {
+    , redis_service(NULL)
+    , bthread_tag(BTHREAD_TAG_INVALID) {
     if (s_ncore > 0) {
         num_threads = s_ncore + 1;
     }
@@ -332,6 +339,9 @@ void* Server::UpdateDerivedVars(void* arg) {
             bvar::to_underscored_name(&mprefix, it->second.method->full_name());
             it->second.status->Expose(mprefix);
         }
+    }
+    if (server->options().baidu_master_service) {
+        server->options().baidu_master_service->Expose(prefix);
     }
     if (server->options().nshead_service) {
         server->options().nshead_service->Expose(prefix);
@@ -524,6 +534,10 @@ int Server::AddBuiltinServices() {
         LOG(ERROR) << "Fail to add ThreadsService";
         return -1;
     }
+    if (AddBuiltinService(new (std::nothrow) MemoryService)) {
+        LOG(ERROR) << "Fail to add MemoryService";
+        return -1;
+    }
 
 #if !BRPC_WITH_GLOG
     if (AddBuiltinService(new (std::nothrow) VLogService)) {
@@ -559,6 +573,10 @@ int Server::AddBuiltinServices() {
     }
     if (AddBuiltinService(new (std::nothrow) GetJsService)) {
         LOG(ERROR) << "Fail to add GetJsService";
+        return -1;
+    }
+    if (AddBuiltinService(new (std::nothrow) GrpcHealthCheckService)) {
+        LOG(ERROR) << "Fail to add GrpcHealthCheckService";
         return -1;
     }
     return 0;
@@ -725,8 +743,8 @@ static int get_port_from_fd(int fd) {
     return ntohs(addr.sin_port);
 }
 
-static bool CreateConcurrencyLimiter(const AdaptiveMaxConcurrency& amc,
-                                     ConcurrencyLimiter** out) {
+bool Server::CreateConcurrencyLimiter(const AdaptiveMaxConcurrency& amc,
+                                      ConcurrencyLimiter** out) {
     if (amc.type() == AdaptiveMaxConcurrency::UNLIMITED()) {
         *out = NULL;
         return true;
@@ -820,6 +838,17 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
 #endif
     }
 
+    auto original_bthread_tag = _options.bthread_tag;
+    if (original_bthread_tag == BTHREAD_TAG_INVALID) {
+        _options.bthread_tag = BTHREAD_TAG_DEFAULT;
+    }
+    if (_options.bthread_tag < BTHREAD_TAG_DEFAULT ||
+        _options.bthread_tag >= FLAGS_task_group_ntags) {
+        LOG(ERROR) << "Fail to set tag " << _options.bthread_tag << ", tag range is ["
+                   << BTHREAD_TAG_DEFAULT << ":" << FLAGS_task_group_ntags << ")";
+        return -1;
+    }
+
     if (_options.http_master_service) {
         // Check requirements for http_master_service:
         //  has "default_method" & request/response have no fields
@@ -903,6 +932,7 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
             init_args[i].done = false;
             init_args[i].stop = false;
             bthread_attr_t tmp = BTHREAD_ATTR_NORMAL;
+            tmp.tag = _options.bthread_tag;
             tmp.keytable_pool = _keytable_pool;
             if (bthread_start_background(
                     &init_args[i].th, &tmp, BthreadInitEntry, &init_args[i]) != 0) {
@@ -1006,7 +1036,11 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
         if (_options.num_threads < BTHREAD_MIN_CONCURRENCY) {
             _options.num_threads = BTHREAD_MIN_CONCURRENCY;
         }
-        bthread_setconcurrency(_options.num_threads);
+        if (original_bthread_tag == BTHREAD_TAG_INVALID) {
+            bthread_setconcurrency(_options.num_threads);
+        } else {
+            bthread_setconcurrency_by_tag(_options.num_threads, _options.bthread_tag);
+        }
     }
 
     for (MethodMap::iterator it = _method_map.begin();
@@ -1026,6 +1060,15 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
             it->second.status->SetConcurrencyLimiter(cl);
         }
     }
+    if (0 != SetServiceMaxConcurrency(_options.nshead_service)) {
+        return -1;
+    }
+#ifdef ENABLE_THRIFT_FRAMED_PROTOCOL
+    if (0 != SetServiceMaxConcurrency(_options.thrift_service)) {
+        return -1;
+    }
+#endif
+
 
     // Create listening ports
     if (port_range.min_port > port_range.max_port) {
@@ -1071,6 +1114,7 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
                 return -1;
             }
             _am->_use_rdma = _options.use_rdma;
+            _am->_bthread_tag = _options.bthread_tag;
         }
         // Set `_status' to RUNNING before accepting connections
         // to prevent requests being rejected as ELOGOFF
@@ -1134,7 +1178,9 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
 
     // Launch _derivative_thread.
     CHECK_EQ(INVALID_BTHREAD, _derivative_thread);
-    if (bthread_start_background(&_derivative_thread, NULL,
+    bthread_attr_t tmp = BTHREAD_ATTR_NORMAL;
+    tmp.tag = _options.bthread_tag;
+    if (bthread_start_background(&_derivative_thread, &tmp,
                                  UpdateDerivedVars, this) != 0) {
         LOG(ERROR) << "Fail to create _derivative_thread";
         return -1;
@@ -1866,6 +1912,7 @@ int StartDummyServerAt(int port, ProfilerLinker) {
                         "DummyServerOf(%s)", GetProgramName()));
             ServerOptions options;
             options.num_threads = 0;
+            options.bthread_tag = bthread_self_tag();
             if (dummy_server->Start(port, &options) != 0) {
                 LOG(ERROR) << "Fail to start dummy_server at port=" << port;
                 return -1;
@@ -2159,7 +2206,7 @@ int Server::ResetMaxConcurrency(int max_concurrency) {
 
 AdaptiveMaxConcurrency& Server::MaxConcurrencyOf(MethodProperty* mp) {
     if (IsRunning()) {
-        LOG(WARNING) << "MaxConcurrencyOf is only allowd before Server started";
+        LOG(WARNING) << "MaxConcurrencyOf is only allowed before Server started";
         return g_default_max_concurrency_of_method;
     }
     if (mp->status == NULL) {
@@ -2173,7 +2220,7 @@ AdaptiveMaxConcurrency& Server::MaxConcurrencyOf(MethodProperty* mp) {
 
 int Server::MaxConcurrencyOf(const MethodProperty* mp) const {
     if (IsRunning()) {
-        LOG(WARNING) << "MaxConcurrencyOf is only allowd before Server started";
+        LOG(WARNING) << "MaxConcurrencyOf is only allowed before Server started";
         return g_default_max_concurrency_of_method;
     }
     if (mp == NULL || mp->status == NULL) {
@@ -2183,13 +2230,39 @@ int Server::MaxConcurrencyOf(const MethodProperty* mp) const {
 }
 
 AdaptiveMaxConcurrency& Server::MaxConcurrencyOf(const butil::StringPiece& full_method_name) {
-    MethodProperty* mp = _method_map.seek(full_method_name);
-    if (mp == NULL) {
-        LOG(ERROR) << "Fail to find method=" << full_method_name;
-        _failed_to_set_max_concurrency_of_method = true;
-        return g_default_max_concurrency_of_method;
-    }
-    return MaxConcurrencyOf(mp);
+    do {
+        if (full_method_name == butil::class_name_str<NsheadService>()) {
+            if (NULL == options().nshead_service) {
+                break;
+            }
+            return options().nshead_service->_max_concurrency;
+        }
+#ifdef ENABLE_THRIFT_FRAMED_PROTOCOL
+        if (full_method_name == butil::class_name_str<ThriftService>()) {
+            if (NULL == options().thrift_service) {
+                break;
+            }
+            return options().thrift_service->_max_concurrency;
+        }
+#endif
+        if (full_method_name == butil::class_name_str<BaiduMasterService>()) {
+            if (NULL == options().baidu_master_service) {
+                break;
+            }
+            return options().baidu_master_service->_max_concurrency;
+        }
+
+        MethodProperty* mp = _method_map.seek(full_method_name);
+        if (mp == NULL) {
+            break;
+        }
+        return MaxConcurrencyOf(mp);
+
+    } while (false);
+
+    LOG(ERROR) << "Fail to find method=" << full_method_name;
+    _failed_to_set_max_concurrency_of_method = true;
+    return g_default_max_concurrency_of_method;
 }
 
 int Server::MaxConcurrencyOf(const butil::StringPiece& full_method_name) const {

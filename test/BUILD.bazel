@@ -53,6 +53,7 @@ TEST_BUTIL_SOURCES = [
     "mru_cache_unittest.cc",
     "small_map_unittest.cc",
     "stack_container_unittest.cc",
+    "mpsc_queue_unittest.cc",
     "cpu_unittest.cc",
     "crash_logging_unittest.cc",
     "leak_tracker_unittest.cc",
@@ -226,6 +227,7 @@ cc_test(
             "bthread_setconcurrency_unittest.cpp",
             # glog CHECK die with a fatal error
             "bthread_key_unittest.cpp",
+            "bthread_butex_multi_tag_unittest.cpp",
         ],
     ),
     copts = COPTS,

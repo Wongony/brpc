@@ -51,6 +51,7 @@
 #include "brpc/channel.h"
 #include "brpc/socket_map.h"
 #include "brpc/controller.h"
+#include "brpc/compress.h"
 #include "echo.pb.h"
 #include "v1.pb.h"
 #include "v2.pb.h"
@@ -97,6 +98,8 @@ bool g_delete = false;
 const std::string EXP_REQUEST = "hello";
 const std::string EXP_RESPONSE = "world";
 const std::string EXP_REQUEST_BASE64 = "aGVsbG8=";
+const std::string EXP_USER_FIELD_KEY = "hello";
+const std::string EXP_USER_FIELD_VALUE = "world";
 
 class EchoServiceImpl : public test::EchoService {
 public:
@@ -117,6 +120,13 @@ public:
             bthread_usleep(request->sleep_us());
         } else {
             LOG(INFO) << "No sleep, protocol=" << cntl->request_protocol();
+        }
+        if (cntl->has_request_user_fields()) {
+            ASSERT_TRUE(!cntl->request_user_fields()->empty());
+            std::string* val = cntl->request_user_fields()->seek(EXP_USER_FIELD_KEY);
+            ASSERT_TRUE(val != NULL);
+            ASSERT_EQ(*val, EXP_USER_FIELD_VALUE);
+            cntl->response_user_fields()->insert(EXP_USER_FIELD_KEY, EXP_USER_FIELD_VALUE);
         }
     }
 
@@ -1620,4 +1630,141 @@ TEST_F(ServerTest, max_concurrency) {
     stub.Echo(&cntl4, &req, NULL, NULL);
     ASSERT_FALSE(cntl4.Failed()) << cntl4.ErrorText();
 }
+
+TEST_F(ServerTest, user_fields) {
+    const int port = 9200;
+    brpc::Server server;
+    EchoServiceImpl service;
+    ASSERT_EQ(0, server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(port, NULL));
+
+    brpc::Channel channel;
+    ASSERT_EQ(0, channel.Init("0.0.0.0", port, NULL));
+    test::EchoService_Stub stub(&channel);
+
+    brpc::Controller cntl;
+    cntl.request_user_fields()->insert(EXP_USER_FIELD_KEY, EXP_USER_FIELD_VALUE);
+    test::EchoRequest req;
+    test::EchoResponse res;
+    req.set_message("hello");
+    stub.Echo(&cntl, &req, &res, NULL);
+
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_TRUE(cntl.has_response_user_fields());
+    ASSERT_TRUE(!cntl.response_user_fields()->empty());
+    std::string* val = cntl.response_user_fields()->seek(EXP_USER_FIELD_KEY);
+    ASSERT_TRUE(val != NULL);
+    ASSERT_EQ(*val, EXP_USER_FIELD_VALUE);
+}
+
+class BaiduMasterServiceImpl : public brpc::BaiduMasterService {
+public:
+    void ProcessRpcRequest(brpc::Controller* cntl,
+                           const brpc::SerializedRequest* request,
+                           brpc::SerializedResponse* response,
+                           ::google::protobuf::Closure* done) override {
+        // This object helps you to call done->Run() in RAII style. If you need
+        // to process the request asynchronously, pass done_guard.release().
+        brpc::ClosureGuard done_guard(done);
+        ASSERT_NE(nullptr, cntl->sampled_request());
+        ASSERT_TRUE(cntl->sampled_request()->meta.has_service_name());
+        ASSERT_EQ(test::EchoService::descriptor()->full_name(),
+                  cntl->sampled_request()->meta.service_name());
+        ASSERT_TRUE(cntl->sampled_request()->meta.has_method_name());
+        ASSERT_EQ("Echo", cntl->sampled_request()->meta.method_name());
+        test::EchoRequest echo_request;
+        test::EchoResponse echo_response;
+        brpc::CompressType type = cntl->request_compress_type();
+        ASSERT_TRUE(brpc::ParseFromCompressedData(
+            request->serialized_data(), &echo_request, type));
+        ASSERT_EQ(EXP_REQUEST, echo_request.message());
+        ASSERT_EQ(EXP_REQUEST, cntl->request_attachment().to_string());
+
+        echo_response.set_message(EXP_RESPONSE);
+        butil::IOBuf compressed_data;
+        ASSERT_TRUE(brpc::SerializeAsCompressedData(
+            echo_response, &response->serialized_data(), type));
+        cntl->set_response_compress_type(type);
+        cntl->response_attachment().append(EXP_RESPONSE);
+    }
+};
+
+TEST_F(ServerTest, baidu_master_service) {
+    butil::EndPoint ep;
+    ASSERT_EQ(0, str2endpoint("127.0.0.1:8613", &ep));
+    brpc::Server server;
+    EchoServiceImpl service;
+    ASSERT_EQ(0, server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE));
+    brpc::ServerOptions opt;
+    opt.baidu_master_service = new BaiduMasterServiceImpl;
+    ASSERT_EQ(0, server.Start(ep, &opt));
+
+    brpc::Channel chan;
+    brpc::ChannelOptions copt;
+    copt.protocol = "baidu_std";
+    ASSERT_EQ(0, chan.Init(ep, &copt));
+    brpc::Controller cntl;
+    test::EchoRequest req;
+    test::EchoResponse res;
+    req.set_message(EXP_REQUEST);
+    cntl.request_attachment().append(EXP_REQUEST);
+    cntl.set_request_compress_type(brpc::COMPRESS_TYPE_GZIP);
+    test::EchoService_Stub stub(&chan);
+    stub.Echo(&cntl, &req, &res, NULL);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(EXP_RESPONSE, res.message());
+    ASSERT_EQ(EXP_RESPONSE, cntl.response_attachment().to_string());
+
+    ASSERT_EQ(0, server.Stop(0));
+    ASSERT_EQ(0, server.Join());
+}
+
+
+TEST_F(ServerTest, generic_call) {
+    butil::EndPoint ep;
+    ASSERT_EQ(0, str2endpoint("127.0.0.1:8613", &ep));
+    brpc::Server server;
+    EchoServiceImpl service;
+    ASSERT_EQ(0, server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE));
+    brpc::ServerOptions opt;
+    opt.baidu_master_service = new BaiduMasterServiceImpl;
+    ASSERT_EQ(0, server.Start(ep, &opt));
+
+    {
+        brpc::Channel chan;
+        brpc::ChannelOptions copt;
+        copt.protocol = "baidu_std";
+        ASSERT_EQ(0, chan.Init(ep, &copt));
+        brpc::Controller cntl;
+        test::EchoRequest req;
+        test::EchoResponse res;
+        req.set_message(EXP_REQUEST);
+
+        brpc::SerializedResponse serialized_response;
+        brpc::SerializedRequest serialized_request;
+        brpc::CompressType type = brpc::COMPRESS_TYPE_GZIP;
+        ASSERT_TRUE(brpc::SerializeAsCompressedData(
+            req, &serialized_request.serialized_data(), type));
+        cntl.request_attachment().append(EXP_REQUEST);
+        cntl.set_request_compress_type(type);
+        auto sampled_request = new (std::nothrow) brpc::SampledRequest();
+        sampled_request->meta.set_service_name(
+            test::EchoService::descriptor()->full_name());
+        sampled_request->meta.set_method_name(
+            test::EchoService::descriptor()->FindMethodByName("Echo")->name());
+        cntl.reset_sampled_request(sampled_request);
+        chan.CallMethod(NULL, &cntl, &serialized_request, &serialized_response, NULL);
+        ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+
+        ASSERT_TRUE(brpc::ParseFromCompressedData(serialized_response.serialized_data(),
+                                                  &res, cntl.response_compress_type()))
+                                                  << serialized_response.serialized_data().size();
+        ASSERT_EQ(EXP_RESPONSE, res.message());
+        ASSERT_EQ(EXP_RESPONSE, cntl.response_attachment().to_string());
+    }
+
+    ASSERT_EQ(0, server.Stop(0));
+    ASSERT_EQ(0, server.Join());
+}
+
 } //namespace

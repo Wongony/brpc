@@ -80,6 +80,7 @@ BAIDU_REGISTER_ERRNO(brpc::ELOGOFF, "Server is stopping");
 BAIDU_REGISTER_ERRNO(brpc::ELIMIT, "Reached server's max_concurrency");
 BAIDU_REGISTER_ERRNO(brpc::ECLOSE, "Close socket initiatively");
 BAIDU_REGISTER_ERRNO(brpc::EITP, "Bad Itp response");
+BAIDU_REGISTER_ERRNO(brpc::ESHUTDOWNWRITE, "Shutdown write of socket");
 
 #if BRPC_WITH_RDMA
 BAIDU_REGISTER_ERRNO(brpc::ERDMA, "RDMA verbs error");
@@ -125,6 +126,7 @@ const Controller* GetSubControllerOfSelectiveChannel(
     const RPCSender* sender, int index);
 
 DECLARE_bool(usercode_in_pthread);
+DECLARE_bool(usercode_in_coroutine);
 static const int MAX_RETRY_COUNT = 1000;
 static bvar::Adder<int64_t>* g_ncontroller = NULL;
 
@@ -209,6 +211,8 @@ void Controller::ResetNonPods() {
     _request_buf.clear();
     delete _http_request;
     delete _http_response;
+    delete _request_user_fields;
+    delete _response_user_fields;
     _request_attachment.clear();
     _response_attachment.clear();
     if (_wpa) {
@@ -283,6 +287,8 @@ void Controller::ResetPods() {
     _idl_result = IDL_VOID_RESULT;
     _http_request = NULL;
     _http_response = NULL;
+    _request_user_fields = NULL;
+    _response_user_fields = NULL;
     _request_stream = INVALID_STREAM_ID;
     _response_stream = INVALID_STREAM_ID;
     _remote_stream_settings = NULL;
@@ -547,13 +553,13 @@ void Controller::NotifyOnCancel(google::protobuf::Closure* callback) {
         LOG(FATAL) << "NotifyCancel a single call more than once!";
         return;
     }
-    if (bthread_id_create(&_oncancel_id, callback, RunOnCancel) != 0) {
-        PLOG(FATAL) << "Fail to create bthread_id";
-        return;
-    }
     SocketUniquePtr sock;
     if (Socket::Address(_current_call.peer_id, &sock) != 0) {
         // Connection already broken
+        return;
+    }
+    if (bthread_id_create(&_oncancel_id, callback, RunOnCancel) != 0) {
+        PLOG(FATAL) << "Fail to create bthread_id";
         return;
     }
     sock->NotifyOnFailed(_oncancel_id);  // Always succeed
@@ -680,7 +686,7 @@ void Controller::OnVersionedRPCReturned(const CompletionInfo& info,
     }
 
 END_OF_RPC:
-    if (new_bthread) {
+    if (new_bthread && !FLAGS_usercode_in_coroutine) {
         // [ Essential for -usercode_in_pthread=true ]
         // When -usercode_in_pthread is on, the reserved threads (set by
         // -usercode_backup_threads) may all block on bthread_id_lock in
@@ -1382,7 +1388,8 @@ void Controller::HandleStreamConnection(Socket *host_socket) {
         }
     }
     if (FailedInline()) {
-        Stream::SetFailed(_request_stream);
+        Stream::SetFailed(_request_stream, _error_code,
+                          "%s", _error_text.c_str());
         if (_remote_stream_settings != NULL) {
             policy::SendStreamRst(host_socket,
                                   _remote_stream_settings->stream_id());
@@ -1418,6 +1425,12 @@ std::string WebEscape(const std::string& source) {
 void Controller::reset_sampled_request(SampledRequest* req) {
     delete _sampled_request;
     _sampled_request = req;
+}
+
+SampledRequest* Controller::release_sampled_request() {
+    SampledRequest* saved_sampled_request = _sampled_request;
+    _sampled_request = NULL;
+    return saved_sampled_request;
 }
 
 void Controller::set_stream_creator(StreamCreator* sc) {

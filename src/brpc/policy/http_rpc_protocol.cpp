@@ -127,6 +127,9 @@ CommonStrings::CommonStrings()
     , AUTHORIZATION("authorization")
     , ACCEPT_ENCODING("accept-encoding")
     , CONTENT_ENCODING("content-encoding")
+    , CONTENT_LENGTH("content_length")
+    , EXPECT("expect")
+    , CONTINUE_100("100-continue")
     , GZIP("gzip")
     , CONNECTION("connection")
     , KEEP_ALIVE("keep-alive")
@@ -705,16 +708,19 @@ class HttpResponseSender {
 friend class HttpResponseSenderAsDone;
 public:
     HttpResponseSender()
-        : _method_status(NULL), _received_us(0), _h2_stream_id(-1) {}
-    HttpResponseSender(Controller* cntl/*own*/)
+        : HttpResponseSender(NULL) {}
+    explicit HttpResponseSender(Controller* cntl/*own*/)
         : _cntl(cntl), _method_status(NULL), _received_us(0), _h2_stream_id(-1) {}
-    HttpResponseSender(HttpResponseSender&& s)
+    HttpResponseSender(HttpResponseSender&& s) noexcept
         : _cntl(std::move(s._cntl))
         , _req(std::move(s._req))
         , _res(std::move(s._res))
-        , _method_status(std::move(s._method_status))
+        , _method_status(s._method_status)
         , _received_us(s._received_us)
         , _h2_stream_id(s._h2_stream_id) {
+        s._method_status = NULL;
+        s._received_us = 0;
+        s._h2_stream_id = -1;
     }
     ~HttpResponseSender();
 
@@ -735,7 +741,7 @@ private:
 
 class HttpResponseSenderAsDone : public google::protobuf::Closure {
 public:
-    HttpResponseSenderAsDone(HttpResponseSender* s) : _sender(std::move(*s)) {}
+    explicit HttpResponseSenderAsDone(HttpResponseSender* s) : _sender(std::move(*s)) {}
     void Run() override {
         _sender._cntl->CallAfterRpcResp(_sender._req.get(), _sender._res.get());
         delete this;
@@ -942,14 +948,10 @@ HttpResponseSender::~HttpResponseSender() {
         }
     } else {
         butil::IOBuf* content = NULL;
-        if ((cntl->Failed() || !cntl->has_progressive_writer()) &&
-            // https://datatracker.ietf.org/doc/html/rfc7231#section-4.3.2
-            // The HEAD method is identical to GET except that the server MUST NOT
-            // send a message body in the response (i.e., the response terminates at
-            // the end of the header section).
-            req_header->method() != HTTP_METHOD_HEAD) {
+        if (cntl->Failed() || !cntl->has_progressive_writer()) {
             content = &cntl->response_attachment();
         }
+        res_header->set_method(req_header->method());
         butil::IOBuf res_buf;
         MakeRawHttpResponse(&res_buf, res_header, content);
         if (FLAGS_http_verbose) {
@@ -1168,6 +1170,29 @@ ParseResult ParseHttpMessage(butil::IOBuf *source, Socket *socket,
             }
             return result;
         } else if (http_imsg->stage() >= HTTP_ON_HEADERS_COMPLETE) {
+            // https://datatracker.ietf.org/doc/html/rfc7231#section-5.1.1
+            // A server that receives a 100-continue expectation in an HTTP/1.0
+            // request MUST ignore that expectation.
+            //
+            // A server MAY omit sending a 100 (Continue) response if it has
+            // already received some or all of the message body for the
+            // corresponding request, or if the framing indicates that there is
+            // no message body.
+            if (http_imsg->parser().type == HTTP_REQUEST &&
+                !http_imsg->header().before_http_1_1()) {
+                const std::string* expect = http_imsg->header().GetHeader(common->EXPECT);
+                if (expect && *expect ==  common->CONTINUE_100) {
+                    // Send 100-continue response back.
+                    butil::IOBuf resp;
+                    HttpHeader header;
+                    header.set_status_code(HTTP_STATUS_CONTINUE);
+                    MakeRawHttpResponse(&resp, &header, NULL);
+                    Socket::WriteOptions wopt;
+                    wopt.ignore_eovercrowded = true;
+                    socket->Write(&resp, &wopt);
+                }
+            }
+
             http_imsg->CheckProgressiveRead(arg, socket);
             if (socket->is_read_progressive()) {
                 // header part of a progressively-read http message is complete,
@@ -1553,15 +1578,17 @@ void ProcessHttpRequest(InputMessageBase *msg) {
                 }
             }
         }
-        SampledRequest* sample = AskToBeSampled();
-        if (sample && !is_http2) {
-            sample->meta.set_compress_type(COMPRESS_TYPE_NONE);
-            sample->meta.set_protocol_type(PROTOCOL_HTTP);
-            sample->meta.set_attachment_size(req_body.size());
+        if (!is_http2) {
+            SampledRequest* sample = AskToBeSampled();
+            if (sample) {
+                sample->meta.set_compress_type(COMPRESS_TYPE_NONE);
+                sample->meta.set_protocol_type(PROTOCOL_HTTP);
+                sample->meta.set_attachment_size(req_body.size());
 
-            butil::EndPoint ep;
-            MakeRawHttpRequest(&sample->request, &req_header, ep, &req_body);
-            sample->submit(start_parse_us);
+                butil::EndPoint ep;
+                MakeRawHttpRequest(&sample->request, &req_header, ep, &req_body);
+                sample->submit(start_parse_us);
+            }
         }
     } else {
         if (imsg_guard->read_body_progressively()) {

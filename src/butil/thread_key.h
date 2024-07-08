@@ -15,14 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef BRPC_THREAD_KEY_H
-#define BRPC_THREAD_KEY_H
+#ifndef  BUTIL_THREAD_KEY_H
+#define  BUTIL_THREAD_KEY_H
 
 #include <limits>
 #include <pthread.h>
 #include <stdlib.h>
 #include <vector>
 #include "butil/scoped_lock.h"
+#include "butil/type_traits.h"
 
 namespace butil {
 
@@ -38,7 +39,7 @@ public:
     static constexpr size_t InvalidID = std::numeric_limits<size_t>::max();
     static constexpr size_t InitSeq = 0;
 
-    constexpr ThreadKey() :_id(InvalidID), _seq(InitSeq) {}
+    constexpr ThreadKey() : _id(InvalidID), _seq(InitSeq) {}
 
     ~ThreadKey() {
         Reset();
@@ -62,7 +63,7 @@ public:
         _seq = InitSeq;
     }
 
-    private:
+private:
     size_t _id; // Key id.
     // Sequence number form g_thread_keys set in thread_key_create.
     size_t _seq;
@@ -110,6 +111,20 @@ public:
     T* operator->() const { return get(); }
 
     T& operator*() const { return *get(); }
+
+    // Iterate through all thread local objects.
+    // Callback, which must accept Args params and return void,
+    // will be called under a thread lock.
+    template <typename Callback>
+    void for_each(Callback&& callback) {
+        BAIDU_CASSERT(
+            (is_result_void<Callback, T*>::value),
+            "Callback must accept Args params and return void");
+        BAIDU_SCOPED_LOCK(_mutex);
+        for (auto ptr : ptrs) {
+            callback(ptr);
+        }
+    }
 
     void reset(T* ptr);
 
@@ -177,6 +192,9 @@ T* ThreadLocal<T>::get() {
 template <typename T>
 void ThreadLocal<T>::reset(T* ptr) {
     T* old_ptr = get();
+    if (ptr == old_ptr) {
+        return;
+    }
     if (thread_setspecific(_key, ptr) != 0) {
         return;
     }
@@ -187,9 +205,9 @@ void ThreadLocal<T>::reset(T* ptr) {
         }
         // Remove and delete old_ptr.
         if (old_ptr) {
-            auto iter = std::find(ptrs.begin(), ptrs.end(), old_ptr);
-            if (iter!=ptrs.end()) {
-                ptrs.erase(iter);
+            auto iter = std::remove(ptrs.begin(), ptrs.end(), old_ptr);
+            if (iter != ptrs.end()) {
+                ptrs.erase(iter, ptrs.end());
             }
             DefaultDtor(old_ptr);
         }
@@ -199,4 +217,4 @@ void ThreadLocal<T>::reset(T* ptr) {
 }
 
 
-#endif //BRPC_THREAD_KEY_H
+#endif // BUTIL_THREAD_KEY_H

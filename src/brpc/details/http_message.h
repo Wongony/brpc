@@ -19,6 +19,7 @@
 #ifndef BRPC_HTTP_MESSAGE_H
 #define BRPC_HTTP_MESSAGE_H
 
+#include <memory>                      // std::unique_ptr
 #include <string>                      // std::string
 #include "butil/macros.h"
 #include "butil/iobuf.h"               // butil::IOBuf
@@ -67,8 +68,8 @@ public:
 
     HttpMethod request_method() const { return _request_method; }
 
-    HttpHeader &header() { return _header; }
-    const HttpHeader &header() const { return _header; }
+    HttpHeader& header() { return _header; }
+    const HttpHeader& header() const { return _header; }
     size_t parsed_length() const { return _parsed_length; }
     
     // Http parser callback functions
@@ -122,7 +123,7 @@ private:
 
 protected:
     // Only valid when -http_verbose is on
-    butil::IOBufBuilder* _vmsgbuilder;
+    std::unique_ptr<butil::IOBufBuilder> _vmsgbuilder;
     size_t _vbodylen;
 };
 

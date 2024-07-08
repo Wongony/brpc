@@ -743,7 +743,8 @@ H2ParseResult H2StreamContext::OnData(
     }
 
     const int64_t acc = _deferred_window_update.fetch_add(frag_size, butil::memory_order_relaxed) + frag_size;
-    if (acc >= _conn_ctx->local_settings().stream_window_size / 2) {
+    // Allocate the quota of the window to each stream.
+    if (acc >= static_cast<int64_t>(_conn_ctx->local_settings().stream_window_size) / (_conn_ctx->VolatilePendingStreamSize() + 1)) {
         if (acc > _conn_ctx->local_settings().stream_window_size) {
             LOG(ERROR) << "Fail to satisfy the stream-level flow control policy";
             return MakeH2Error(H2_FLOW_CONTROL_ERROR, frame_head.stream_id);
@@ -1285,10 +1286,10 @@ int H2StreamContext::ConsumeHeaders(butil::IOBufBytesIterator& it) {
         }
 
         if (FLAGS_http_verbose) {
-            butil::IOBufBuilder* vs = this->_vmsgbuilder;
+            butil::IOBufBuilder* vs = this->_vmsgbuilder.get();
             if (vs == NULL) {
                 vs = new butil::IOBufBuilder;
-                this->_vmsgbuilder = vs;
+                this->_vmsgbuilder.reset(vs);
                 if (_conn_ctx->is_server_side()) {
                     *vs << "[ H2 REQUEST @" << butil::my_ip() << " ]";
                 } else {

@@ -66,6 +66,7 @@ DEFINE_int32(socket_keepalive_count, -1,
              "Set number of keepalives of sockets before close if this value is positive");
 
 DECLARE_bool(usercode_in_pthread);
+DECLARE_bool(usercode_in_coroutine);
 DECLARE_uint64(max_body_size);
 
 const size_t MSG_SIZE_WINDOW = 10;  // Take last so many message into stat.
@@ -113,9 +114,13 @@ ParseResult InputMessenger::CutInputMessage(
             }
 
             if (m->CreatedByConnect()) {
-                if((ProtocolType)cur_index == PROTOCOL_BAIDU_STD) {
+                if((ProtocolType)cur_index == PROTOCOL_BAIDU_STD && cur_index == preferred) {
                     // baidu_std may fall to streaming_rpc.
                     cur_index = (int)PROTOCOL_STREAMING_RPC;
+                    continue;
+                } else if((ProtocolType)cur_index == PROTOCOL_STREAMING_RPC && cur_index == preferred) {
+                    // streaming_rpc may fall to baidu_std.
+                    cur_index = (int)PROTOCOL_BAIDU_STD;
                     continue;
                 } else {
                     // The protocol is fixed at client-side, no need to try others.
@@ -194,7 +199,8 @@ static void QueueMessage(InputMessageBase* to_run_msg,
                           BTHREAD_ATTR_PTHREAD :
                           BTHREAD_ATTR_NORMAL) | BTHREAD_NOSIGNAL;
     tmp.keytable_pool = keytable_pool;
-    if (bthread_start_background(
+    tmp.tag = bthread_self_tag();
+    if (!FLAGS_usercode_in_coroutine && bthread_start_background(
             &th, &tmp, ProcessInputMessage, to_run_msg) == 0) {
         ++*num_bthread_created;
     } else {
