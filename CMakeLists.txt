@@ -36,7 +36,7 @@ if(POLICY CMP0042)
     cmake_policy(SET CMP0042 NEW)
 endif()
 
-set(BRPC_VERSION 1.9.0)
+set(BRPC_VERSION 1.10.0)
 
 SET(CPACK_GENERATOR "DEB")
 SET(CPACK_DEBIAN_PACKAGE_MAINTAINER "brpc authors")
@@ -253,7 +253,7 @@ if(WITH_BORINGSSL)
     find_package(BoringSSL)
     include_directories(${BORINGSSL_INCLUDE_DIR})
 else()
-    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND NOT OPENSSL_ROOT_DIR)
         set(OPENSSL_ROOT_DIR
             "/usr/local/opt/openssl" # Homebrew installed OpenSSL
         )

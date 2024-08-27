@@ -44,6 +44,7 @@
 #include "brpc/interceptor.h"
 #include "brpc/concurrency_limiter.h"
 #include "brpc/baidu_master_service.h"
+#include "brpc/rpc_pb_message_factory.h"
 
 namespace brpc {
 
@@ -226,6 +227,13 @@ struct ServerOptions {
     // Default: false
     bool use_rdma;
 
+    // [CAUTION] This option is for implementing specialized baidu-std proxies,
+    // most users don't need it. Don't change this option unless you fully
+    // understand the description below.
+    // If this option is set, all baidu-std requests to the server will be delegated
+    // to this service.
+    //
+    // Owned by Server and deleted in server's destructor.
     BaiduMasterService* baidu_master_service;
 
     // [CAUTION] This option is for implementing specialized http proxies,
@@ -269,6 +277,15 @@ struct ServerOptions {
     // Server will run in this tagged bthread worker group
     // Default: BTHREAD_TAG_DEFAULT
     bthread_tag_t bthread_tag;
+
+    // [CAUTION] This option is for implementing specialized rpc protobuf
+    // message factory, most users don't need it. Don't change this option
+    // unless you fully understand the description below.
+    // If this option is set, all baidu-std rpc request message and response
+    // message will be created by this factory.
+    //
+    // Owned by Server and deleted in server's destructor.
+    RpcPBMessageFactory* rpc_pb_message_factory;
 
 private:
     // SSLOptions is large and not often used, allocate it on heap to

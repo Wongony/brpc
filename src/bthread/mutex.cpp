@@ -20,7 +20,6 @@
 // Date: Sun Aug  3 12:46:15 CST 2014
 
 #include <pthread.h>
-#include <execinfo.h>
 #include <dlfcn.h>                               // dlsym
 #include <fcntl.h>                               // O_RDONLY
 #include "butil/atomicops.h"
@@ -34,26 +33,25 @@
 #include "butil/files/file_path.h"
 #include "butil/file_util.h"
 #include "butil/unique_ptr.h"
+#include "butil/memory/scope_guard.h"
 #include "butil/third_party/murmurhash3/murmurhash3.h"
+#include "butil/third_party/symbolize/symbolize.h"
 #include "butil/logging.h"
 #include "butil/object_pool.h"
+#include "butil/debug/stack_trace.h"
 #include "bthread/butex.h"                       // butex_*
-#include "bthread/processor.h"                   // cpu_relax, barrier
 #include "bthread/mutex.h"                       // bthread_mutex_t
 #include "bthread/sys_futex.h"
 #include "bthread/log.h"
+#include "butil/debug/stack_trace.h"
 
 extern "C" {
-extern void* __attribute__((weak)) _dl_sym(void* handle, const char* symbol, void* caller);
+extern void* BAIDU_WEAK _dl_sym(void* handle, const char* symbol, void* caller);
 }
-extern int __attribute__((weak)) GetStackTrace(void** result, int max_depth, int skip_count);
 
 namespace bthread {
 // Warm up backtrace before main().
-void* dummy_buf[4];
-const int ALLOW_UNUSED dummy_bt = GetStackTrace
-    ? GetStackTrace(dummy_buf, arraysize(dummy_buf), 0)
-    : backtrace(dummy_buf, arraysize(dummy_buf));
+const butil::debug::StackTrace ALLOW_UNUSED dummy_bt;
 
 // For controlling contentions collected per second.
 static bvar::CollectorSpeedLimit g_cp_sl = BVAR_COLLECTOR_SPEED_LIMIT_INITIALIZER;
@@ -376,14 +374,17 @@ make_contention_site_invalid(bthread_contention_site_t* cs) {
     cs->sampling_range = 0;
 }
 
+#ifndef NO_PTHREAD_MUTEX_HOOK
 // Replace pthread_mutex_lock and pthread_mutex_unlock:
 // First call to sys_pthread_mutex_lock sets sys_pthread_mutex_lock to the
 // real function so that next calls go to the real function directly. This
 // technique avoids calling pthread_once each time.
 typedef int (*MutexOp)(pthread_mutex_t*);
 int first_sys_pthread_mutex_lock(pthread_mutex_t* mutex);
+int first_sys_pthread_mutex_trylock(pthread_mutex_t* mutex);
 int first_sys_pthread_mutex_unlock(pthread_mutex_t* mutex);
 static MutexOp sys_pthread_mutex_lock = first_sys_pthread_mutex_lock;
+static MutexOp sys_pthread_mutex_trylock = first_sys_pthread_mutex_trylock;
 static MutexOp sys_pthread_mutex_unlock = first_sys_pthread_mutex_unlock;
 static pthread_once_t init_sys_mutex_lock_once = PTHREAD_ONCE_INIT;
 
@@ -418,20 +419,30 @@ static pthread_once_t init_sys_mutex_lock_once = PTHREAD_ONCE_INIT;
 // causing deadlock temporarily. This fix is hardly portable.
 
 static void init_sys_mutex_lock() {
+// When bRPC library is linked as a shared library, need to make sure bRPC
+// shared library is loaded before the pthread shared library. Otherwise,
+// it may cause runtime error: undefined symbol: pthread_mutex_xxx.
+// Alternatively, static linking can also avoid this problem.
 #if defined(OS_LINUX)
     // TODO: may need dlvsym when GLIBC has multiple versions of a same symbol.
     // http://blog.fesnel.com/blog/2009/08/25/preloading-with-multiple-symbol-versions
     if (_dl_sym) {
-        sys_pthread_mutex_lock = (MutexOp)_dl_sym(RTLD_NEXT, "pthread_mutex_lock", (void*)init_sys_mutex_lock);
-        sys_pthread_mutex_unlock = (MutexOp)_dl_sym(RTLD_NEXT, "pthread_mutex_unlock", (void*)init_sys_mutex_lock);
+        sys_pthread_mutex_lock = (MutexOp)_dl_sym(
+            RTLD_NEXT, "pthread_mutex_lock", (void*)init_sys_mutex_lock);
+        sys_pthread_mutex_unlock = (MutexOp)_dl_sym(
+            RTLD_NEXT, "pthread_mutex_unlock", (void*)init_sys_mutex_lock);
+        sys_pthread_mutex_trylock = (MutexOp)_dl_sym(
+            RTLD_NEXT, "pthread_mutex_trylock", (void*)init_sys_mutex_lock);
     } else {
         // _dl_sym may be undefined reference in some system, fallback to dlsym
         sys_pthread_mutex_lock = (MutexOp)dlsym(RTLD_NEXT, "pthread_mutex_lock");
         sys_pthread_mutex_unlock = (MutexOp)dlsym(RTLD_NEXT, "pthread_mutex_unlock");
+        sys_pthread_mutex_trylock = (MutexOp)dlsym(RTLD_NEXT, "pthread_mutex_trylock");
     }
 #elif defined(OS_MACOSX)
     // TODO: look workaround for dlsym on mac
     sys_pthread_mutex_lock = (MutexOp)dlsym(RTLD_NEXT, "pthread_mutex_lock");
+    sys_pthread_mutex_trylock = (MutexOp)dlsym(RTLD_NEXT, "pthread_mutex_trylock");
     sys_pthread_mutex_unlock = (MutexOp)dlsym(RTLD_NEXT, "pthread_mutex_unlock");
 #endif
 }
@@ -443,10 +454,17 @@ int first_sys_pthread_mutex_lock(pthread_mutex_t* mutex) {
     pthread_once(&init_sys_mutex_lock_once, init_sys_mutex_lock);
     return sys_pthread_mutex_lock(mutex);
 }
+
+int first_sys_pthread_mutex_trylock(pthread_mutex_t* mutex) {
+    pthread_once(&init_sys_mutex_lock_once, init_sys_mutex_lock);
+    return sys_pthread_mutex_trylock(mutex);
+}
+
 int first_sys_pthread_mutex_unlock(pthread_mutex_t* mutex) {
     pthread_once(&init_sys_mutex_lock_once, init_sys_mutex_lock);
     return sys_pthread_mutex_unlock(mutex);
 }
+#endif
 
 template <typename Mutex>
 inline uint64_t hash_mutex_ptr(const Mutex* m) {
@@ -456,6 +474,31 @@ inline uint64_t hash_mutex_ptr(const Mutex* m) {
 // Mark being inside locking so that pthread_mutex calls inside collecting
 // code are never sampled, otherwise deadlock may occur.
 static __thread bool tls_inside_lock = false;
+
+// Warn up some singleton objects used in contention profiler
+// to avoid deadlock in malloc call stack.
+static __thread bool tls_warn_up = false;
+
+// ++tls_pthread_lock_count when pthread locking,
+// --tls_pthread_lock_count when pthread unlocking.
+// Only when it is equal to 0, it is safe for the bthread to be scheduled.
+static __thread int tls_pthread_lock_count = 0;
+
+void CheckBthreadScheSafety() {
+    if (BAIDU_LIKELY(0 == tls_pthread_lock_count)) {
+        return;
+    }
+
+    static butil::atomic<bool> b_sched_in_p_lock_logged{false};
+    if (BAIDU_UNLIKELY(!b_sched_in_p_lock_logged.exchange(
+        true, butil::memory_order_relaxed))) {
+        butil::debug::StackTrace trace(true);
+        // It can only be checked once because the counter is messed up.
+        LOG(ERROR) << "bthread is suspended while holding"
+                   << tls_pthread_lock_count << " pthread locks."
+                   << std::endl << trace.ToString();
+    }
+}
 
 // Speed up with TLS:
 //   Most pthread_mutex are locked and unlocked in the same thread. Putting
@@ -527,6 +570,26 @@ inline bool remove_pthread_contention_site(const Mutex* mutex,
 // Submit the contention along with the callsite('s stacktrace)
 void submit_contention(const bthread_contention_site_t& csite, int64_t now_ns) {
     tls_inside_lock = true;
+    BRPC_SCOPE_EXIT {
+        tls_inside_lock = false;
+    };
+
+    butil::debug::StackTrace stack(true); // May lock.
+    if (0 == stack.FrameCount()) {
+        return;
+    }
+    // There are two situations where we need to check whether in the
+    // malloc call stack:
+    // 1. Warn up some singleton objects used in `submit_contention'
+    // to avoid deadlock in malloc call stack.
+    // 2. LocalPool is empty, GlobalPool may allocate memory by malloc.
+    if (!tls_warn_up || butil::local_pool_free_empty<SampledContention>()) {
+        // In malloc call stack, can not submit contention.
+        if (stack.FindSymbol((void*)malloc)) {
+            return;
+        }
+    }
+
     auto sc = butil::get_object<SampledContention>();
     // Normalize duration_us and count so that they're addable in later
     // processings. Notice that sampling_range is adjusted periodically by
@@ -534,25 +597,32 @@ void submit_contention(const bthread_contention_site_t& csite, int64_t now_ns) {
     sc->duration_ns = csite.duration_ns * bvar::COLLECTOR_SAMPLING_BASE
         / csite.sampling_range;
     sc->count = bvar::COLLECTOR_SAMPLING_BASE / (double)csite.sampling_range;
-    sc->nframes = GetStackTrace
-        ? GetStackTrace(sc->stack, arraysize(sc->stack), 0)
-        : backtrace(sc->stack, arraysize(sc->stack)); // may lock
+    sc->nframes = stack.CopyAddressTo(sc->stack, arraysize(sc->stack));
     sc->submit(now_ns / 1000);  // may lock
-    tls_inside_lock = false;
+    // Once submit a contention, complete warn up.
+    tls_warn_up = true;
 }
 
 namespace internal {
+#ifndef NO_PTHREAD_MUTEX_HOOK
 BUTIL_FORCE_INLINE int pthread_mutex_lock_internal(pthread_mutex_t* mutex) {
+    ++bthread::tls_pthread_lock_count;
     return sys_pthread_mutex_lock(mutex);
 }
 
 BUTIL_FORCE_INLINE int pthread_mutex_trylock_internal(pthread_mutex_t* mutex) {
-    return ::pthread_mutex_trylock(mutex);
+    int rc = sys_pthread_mutex_trylock(mutex);
+    if (0 == rc) {
+        ++tls_pthread_lock_count;
+    }
+    return rc;
 }
 
 BUTIL_FORCE_INLINE int pthread_mutex_unlock_internal(pthread_mutex_t* mutex) {
+    --tls_pthread_lock_count;
     return sys_pthread_mutex_unlock(mutex);
 }
+#endif
 
 BUTIL_FORCE_INLINE int pthread_mutex_lock_internal(FastPthreadMutex* mutex) {
     mutex->lock();
@@ -622,6 +692,11 @@ BUTIL_FORCE_INLINE int pthread_mutex_lock_impl(Mutex* mutex) {
 }
 
 template <typename Mutex>
+BUTIL_FORCE_INLINE int pthread_mutex_trylock_impl(Mutex* mutex) {
+    return pthread_mutex_trylock_internal(mutex);
+}
+
+template <typename Mutex>
 BUTIL_FORCE_INLINE int pthread_mutex_unlock_impl(Mutex* mutex) {
     // Don't change behavior of unlock when profiler is off.
     if (!g_cp || tls_inside_lock) {
@@ -666,13 +741,19 @@ BUTIL_FORCE_INLINE int pthread_mutex_unlock_impl(Mutex* mutex) {
 
 }
 
+#ifndef NO_PTHREAD_MUTEX_HOOK
 BUTIL_FORCE_INLINE int pthread_mutex_lock_impl(pthread_mutex_t* mutex) {
     return internal::pthread_mutex_lock_impl(mutex);
+}
+
+BUTIL_FORCE_INLINE int pthread_mutex_trylock_impl(pthread_mutex_t* mutex) {
+    return internal::pthread_mutex_trylock_impl(mutex);
 }
 
 BUTIL_FORCE_INLINE int pthread_mutex_unlock_impl(pthread_mutex_t* mutex) {
     return internal::pthread_mutex_unlock_impl(mutex);
 }
+#endif
 
 // Implement bthread_mutex_t related functions
 struct MutexInternal {
@@ -733,24 +814,30 @@ int FastPthreadMutex::lock_contended() {
 }
 
 void FastPthreadMutex::lock() {
-    bthread::MutexInternal* split = (bthread::MutexInternal*)&_futex;
+    auto split = (bthread::MutexInternal*)&_futex;
     if (split->locked.exchange(1, butil::memory_order_acquire)) {
         (void)lock_contended();
     }
+    ++tls_pthread_lock_count;
 }
 
 bool FastPthreadMutex::try_lock() {
-    bthread::MutexInternal* split = (bthread::MutexInternal*)&_futex;
-    return !split->locked.exchange(1, butil::memory_order_acquire);
+    auto split = (bthread::MutexInternal*)&_futex;
+    bool lock = !split->locked.exchange(1, butil::memory_order_acquire);
+    if (lock) {
+        ++tls_pthread_lock_count;
+    }
+    return lock;
 }
 
 void FastPthreadMutex::unlock() {
-    butil::atomic<unsigned>* whole = (butil::atomic<unsigned>*)&_futex;
+    auto whole = (butil::atomic<unsigned>*)&_futex;
     const unsigned prev = whole->exchange(0, butil::memory_order_release);
     // CAUTION: the mutex may be destroyed, check comments before butex_create
     if (prev != BTHREAD_MUTEX_LOCKED) {
         futex_wake_private(whole, 1);
     }
+    --tls_pthread_lock_count;
 }
 
 } // namespace internal
@@ -879,11 +966,16 @@ int bthread_mutex_unlock(bthread_mutex_t* m) {
     return 0;
 }
 
-int pthread_mutex_lock (pthread_mutex_t *__mutex) {
+#ifndef NO_PTHREAD_MUTEX_HOOK
+int pthread_mutex_lock(pthread_mutex_t* __mutex) {
     return bthread::pthread_mutex_lock_impl(__mutex);
 }
-int pthread_mutex_unlock (pthread_mutex_t *__mutex) {
+int pthread_mutex_trylock(pthread_mutex_t* __mutex) {
+    return bthread::pthread_mutex_trylock_impl(__mutex);
+}
+int pthread_mutex_unlock(pthread_mutex_t* __mutex) {
     return bthread::pthread_mutex_unlock_impl(__mutex);
 }
+#endif
 
 }  // extern "C"

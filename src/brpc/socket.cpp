@@ -57,8 +57,7 @@
 #endif
 
 namespace bthread {
-size_t __attribute__((weak))
-get_sizes(const bthread_id_list_t* list, size_t* cnt, size_t n);
+size_t BAIDU_WEAK get_sizes(const bthread_id_list_t* list, size_t* cnt, size_t n);
 }
 
 
@@ -750,7 +749,7 @@ int Socket::OnCreated(const SocketOptions& options) {
 #if BRPC_WITH_RDMA
     CHECK(_rdma_ep == NULL);
     if (options.use_rdma) {
-        _rdma_ep = new (std::nothrow)rdma::RdmaEndpoint(m);
+        _rdma_ep = new (std::nothrow)rdma::RdmaEndpoint(this);
         if (!_rdma_ep) {
             const int saved_errno = errno;
             PLOG(ERROR) << "Fail to create RdmaEndpoint";
@@ -835,6 +834,10 @@ void Socket::BeforeRecycled() {
         sp->RemoveRefManually();
     }
 
+    // Reset `_io_event' at the end.
+    BRPC_SCOPE_EXIT {
+        _io_event.Reset();
+    };
     const int prev_fd = _fd.exchange(-1, butil::memory_order_relaxed);
     if (ValidFileDescriptor(prev_fd)) {
         if (_on_edge_triggered_events != NULL) {
@@ -845,7 +848,6 @@ void Socket::BeforeRecycled() {
             g_vars->channel_conn << -1;
         }
     }
-    _io_event.Reset();
 
 #if BRPC_WITH_RDMA
     if (_rdma_ep) {

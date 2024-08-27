@@ -52,7 +52,7 @@ template <typename T>
 class ObjectPoolAllocator {
 public:
     void* Alloc() { return get_object<MPSCQueueNode<T>>(); }
-    void Free(void* p) { return_object(p); }
+    void Free(void* p) { return_object(static_cast<MPSCQueueNode<T>*>(p)); }
 };
 
 
@@ -129,13 +129,12 @@ bool MPSCQueue<T, Alloc>::DequeueImpl(T* data) {
     if (_cur_dequeue_node) {
         node = _cur_dequeue_node;
     } else {
-        node = _cur_enqueue_node.load(memory_order_relaxed);
+        node = _cur_enqueue_node.exchange(NULL, memory_order_relaxed);
     }
     if (!node) {
         return false;
     }
 
-    _cur_enqueue_node.store(NULL, memory_order_relaxed);
     if (data) {
         auto mem = (T* const)node->data_mem;
         *data = std::move(*mem);
