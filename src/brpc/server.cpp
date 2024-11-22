@@ -152,7 +152,8 @@ ServerOptions::ServerOptions()
     , rtmp_service(NULL)
     , redis_service(NULL)
     , bthread_tag(BTHREAD_TAG_INVALID)
-    , rpc_pb_message_factory(new DefaultRpcPBMessageFactory()) {
+    , rpc_pb_message_factory(new DefaultRpcPBMessageFactory())
+    , ignore_eovercrowded(false) {
     if (s_ncore > 0) {
         num_threads = s_ncore + 1;
     }
@@ -1043,11 +1044,7 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
         if (_options.num_threads < BTHREAD_MIN_CONCURRENCY) {
             _options.num_threads = BTHREAD_MIN_CONCURRENCY;
         }
-        if (original_bthread_tag == BTHREAD_TAG_INVALID) {
-            bthread_setconcurrency(_options.num_threads);
-        } else {
-            bthread_setconcurrency_by_tag(_options.num_threads, _options.bthread_tag);
-        }
+        bthread_setconcurrency_by_tag(_options.num_threads, _options.bthread_tag);
     }
 
     for (MethodMap::iterator it = _method_map.begin();

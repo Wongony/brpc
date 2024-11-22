@@ -26,6 +26,8 @@ option(WITH_DEBUG_SYMBOLS "With debug symbols" ON)
 option(WITH_THRIFT "With thrift framed protocol supported" OFF)
 option(WITH_SNAPPY "With snappy" OFF)
 option(WITH_RDMA "With RDMA" OFF)
+option(WITH_DEBUG_BTHREAD_SCHE_SAFETY "With debugging bthread sche safety" OFF)
+option(WITH_DEBUG_LOCK "With debugging lock" OFF)
 option(BUILD_UNIT_TESTS "Whether to build unit tests" OFF)
 option(BUILD_FUZZ_TESTS "Whether to build fuzz tests" OFF)
 option(BUILD_BRPC_TOOLS "Whether to build brpc tools" ON)
@@ -36,7 +38,7 @@ if(POLICY CMP0042)
     cmake_policy(SET CMP0042 NEW)
 endif()
 
-set(BRPC_VERSION 1.10.0)
+set(BRPC_VERSION 1.11.0)
 
 SET(CPACK_GENERATOR "DEB")
 SET(CPACK_DEBIAN_PACKAGE_MAINTAINER "brpc authors")
@@ -66,6 +68,11 @@ if(WITH_DEBUG_SYMBOLS)
     set(DEBUG_SYMBOL "-g")
 endif()
 
+set(WITH_DEBUG_LOCK_VAL "0")
+if(WITH_DEBUG_LOCK)
+    set(WITH_DEBUG_LOCK_VAL "1")
+endif()
+
 if(WITH_THRIFT)
     set(THRIFT_CPP_FLAG "-DENABLE_THRIFT_FRAMED_PROTOCOL")
     find_library(THRIFT_LIB NAMES thrift)
@@ -79,11 +86,16 @@ if(WITH_RDMA)
     set(WITH_RDMA_VAL "1")
 endif()
 
+set(WITH_DEBUG_BTHREAD_SCHE_SAFETY_VAL "0")
+if(WITH_DEBUG_BTHREAD_SCHE_SAFETY)
+    set(WITH_DEBUG_BTHREAD_SCHE_SAFETY_VAL "1")
+endif()
+
 include(GNUInstallDirs)
 
 configure_file(${PROJECT_SOURCE_DIR}/config.h.in ${PROJECT_SOURCE_DIR}/src/butil/config.h @ONLY)
 
-set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
 find_package(GFLAGS REQUIRED)
 
@@ -117,7 +129,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -Wno-deprecated-declarations -Wno-inconsistent-missing-override")
 endif()
 
-set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} ${DEFINE_CLOCK_GETTIME} -DBRPC_WITH_GLOG=${WITH_GLOG_VAL} -DBRPC_WITH_RDMA=${WITH_RDMA_VAL} -DGFLAGS_NS=${GFLAGS_NS}")
+set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} ${DEFINE_CLOCK_GETTIME} -DBRPC_WITH_GLOG=${WITH_GLOG_VAL} -DBRPC_WITH_RDMA=${WITH_RDMA_VAL} -DGFLAGS_NS=${GFLAGS_NS} -DBRPC_DEBUG_BTHREAD_SCHE_SAFETY=${WITH_DEBUG_BTHREAD_SCHE_SAFETY_VAL} -DBRPC_DEBUG_LOCK=${WITH_DEBUG_LOCK_VAL}")
 if(WITH_MESALINK)
     set(CMAKE_CPP_FLAGS "${CMAKE_CPP_FLAGS} -DUSE_MESALINK")
 endif()
@@ -322,7 +334,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         "-Wl,-U,_MallocExtension_ReleaseFreeMemory"
         "-Wl,-U,_ProfilerStart"
         "-Wl,-U,_ProfilerStop"
-        "-Wl,-U,__Z13GetStackTracePPvii")
+        "-Wl,-U,__Z13GetStackTracePPvii"
+        "-Wl,-U,_mallctl"
+        "-Wl,-U,_malloc_stats_print"
+    )
 endif()
 
 # for *.so

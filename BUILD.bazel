@@ -45,6 +45,12 @@ COPTS = [
 }) + select({
     "//bazel/config:brpc_with_rdma": ["-DBRPC_WITH_RDMA=1"],
     "//conditions:default": [""],
+}) + select({
+    "//bazel/config:brpc_with_debug_bthread_sche_safety": ["-DBRPC_DEBUG_BTHREAD_SCHE_SAFETY=1"],
+    "//conditions:default": ["-DBRPC_DEBUG_BTHREAD_SCHE_SAFETY=0"],
+}) + select({
+      "//bazel/config:brpc_with_debug_lock": ["-DBRPC_DEBUG_LOCK=1"],
+      "//conditions:default": ["-DBRPC_DEBUG_LOCK=0"],
 })
 
 LINKOPTS = [
@@ -63,6 +69,8 @@ LINKOPTS = [
         "-Wl,-U,_ProfilerStop",
         "-Wl,-U,__Z13GetStackTracePPvii",
         "-Wl,-U,_RegisterThriftProtocol",
+        "-Wl,-U,_mallctl",
+        "-Wl,-U,_malloc_stats_print",
     ],
     "//conditions:default": [
         "-lrt",
