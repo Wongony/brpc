@@ -24,12 +24,13 @@
 #include <google/protobuf/descriptor.h>             // ServiceDescriptor
 #include "idl_options.pb.h"                         // option(idl_support)
 #include "bthread/unstable.h"                       // bthread_keytable_pool_init
-#include "butil/macros.h"                            // ARRAY_SIZE
-#include "butil/fd_guard.h"                          // fd_guard
-#include "butil/logging.h"                           // CHECK
+#include "butil/macros.h"                           // ARRAY_SIZE
+#include "butil/fd_guard.h"                         // fd_guard
+#include "butil/logging.h"                          // CHECK
 #include "butil/time.h"
 #include "butil/class_name.h"
 #include "butil/string_printf.h"
+#include "butil/debug/leak_annotations.h"
 #include "brpc/log.h"
 #include "brpc/compress.h"
 #include "brpc/policy/nova_pbrpc_protocol.h"
@@ -118,8 +119,6 @@ DEFINE_bool(enable_threads_service, false, "Enable /threads");
 DECLARE_int32(usercode_backup_threads);
 DECLARE_bool(usercode_in_pthread);
 
-const int INITIAL_SERVICE_CAP = 64;
-const int INITIAL_CERT_MAP = 64;
 // NOTE: never make s_ncore extern const whose ctor seq against other
 // compilation units is undefined.
 const int s_ncore = sysconf(_SC_NPROCESSORS_ONLN);
@@ -180,7 +179,8 @@ Server::MethodProperty::MethodProperty()
     , http_url(NULL)
     , service(NULL)
     , method(NULL)
-    , status(NULL) {
+    , status(NULL)
+    , ignore_eovercrowded(false) {
 }
 
 static timeval GetUptime(void* arg/*start_time*/) {
@@ -412,6 +412,7 @@ Server::Server(ProfilerLinker)
     , _builtin_service_count(0)
     , _virtual_service_count(0)
     , _failed_to_set_max_concurrency_of_method(false)
+    , _failed_to_set_ignore_eovercrowded(false)
     , _am(NULL)
     , _internal_am(NULL)
     , _first_service(NULL)
@@ -662,22 +663,6 @@ int Server::InitializeOnce() {
     if (_status != UNINITIALIZED) {
         return 0;
     }
-    if (_fullname_service_map.init(INITIAL_SERVICE_CAP) != 0) {
-        LOG(ERROR) << "Fail to init _fullname_service_map";
-        return -1;
-    }
-    if (_service_map.init(INITIAL_SERVICE_CAP) != 0) {
-        LOG(ERROR) << "Fail to init _service_map";
-        return -1;
-    }
-    if (_method_map.init(INITIAL_SERVICE_CAP * 2) != 0) {
-        LOG(ERROR) << "Fail to init _method_map";
-        return -1;
-    }
-    if (_ssl_ctx_map.init(INITIAL_CERT_MAP) != 0) {
-        LOG(ERROR) << "Fail to init _ssl_ctx_map";
-        return -1;
-    }
     _status = READY;
     return 0;
 }
@@ -795,6 +780,7 @@ static bool OptionsAvailableOverRdma(const ServerOptions* opt) {
 #endif
 
 static AdaptiveMaxConcurrency g_default_max_concurrency_of_method(0);
+static bool g_default_ignore_eovercrowded(false);
 
 int Server::StartInternal(const butil::EndPoint& endpoint,
                           const PortRange& port_range,
@@ -803,6 +789,12 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
     if (_failed_to_set_max_concurrency_of_method) {
         _failed_to_set_max_concurrency_of_method = false;
         LOG(ERROR) << "previous call to MaxConcurrencyOf() was failed, "
+            "fix it before starting server";
+        return -1;
+    }
+    if (_failed_to_set_ignore_eovercrowded) {
+        _failed_to_set_ignore_eovercrowded = false;
+        LOG(ERROR) << "previous call to IgnoreEovercrowdedOf() was failed, "
             "fix it before starting server";
         return -1;
     }
@@ -894,6 +886,10 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
         _session_local_data_pool->Reserve(_options.reserved_session_local_data);
     }
 
+    // Leak of `_keytable_pool' and others is by design.
+    // See comments in Server::Join() for details.
+    // Instruct LeakSanitizer to ignore the designated memory leak.
+    ANNOTATE_SCOPED_MEMORY_LEAK;
     // Init _keytable_pool always. If the server was stopped before, the pool
     // should be destroyed in Join().
     _keytable_pool = new bthread_keytable_pool_t;
@@ -2021,17 +2017,6 @@ int Server::AddCertificate(const CertInfo& cert) {
 }
 
 bool Server::AddCertMapping(CertMaps& bg, const SSLContext& ssl_ctx) {
-    if (!bg.cert_map.initialized()
-        && bg.cert_map.init(INITIAL_CERT_MAP) != 0) {
-        LOG(ERROR) << "Fail to init _cert_map";
-        return false;
-    }
-    if (!bg.wildcard_cert_map.initialized()
-        && bg.wildcard_cert_map.init(INITIAL_CERT_MAP) != 0) {
-        LOG(ERROR) << "Fail to init _wildcard_cert_map";
-        return false;
-    }
-
     for (size_t i = 0; i < ssl_ctx.filters.size(); ++i) {
         const char* hostname = ssl_ctx.filters[i].c_str();
         CertMap* cmap = NULL;
@@ -2102,8 +2087,8 @@ int Server::ResetCertificates(const std::vector<CertInfo>& certs) {
     }
 
     SSLContextMap tmp_map;
-    if (tmp_map.init(INITIAL_CERT_MAP) != 0) {
-        LOG(ERROR) << "Fail to initialize tmp_map";
+    if (tmp_map.init(certs.size() + 1) != 0) {
+        LOG(ERROR) << "Fail to init tmp_map";
         return -1;
     }
 
@@ -2147,16 +2132,6 @@ int Server::ResetCertificates(const std::vector<CertInfo>& certs) {
 }
 
 bool Server::ResetCertMappings(CertMaps& bg, const SSLContextMap& ctx_map) {
-    if (!bg.cert_map.initialized()
-        && bg.cert_map.init(INITIAL_CERT_MAP) != 0) {
-        LOG(ERROR) << "Fail to init _cert_map";
-        return false;
-    }
-    if (!bg.wildcard_cert_map.initialized()
-        && bg.wildcard_cert_map.init(INITIAL_CERT_MAP) != 0) {
-        LOG(ERROR) << "Fail to init _wildcard_cert_map";
-        return false;
-    }
     bg.cert_map.clear();
     bg.wildcard_cert_map.clear();
 
@@ -2296,6 +2271,38 @@ AdaptiveMaxConcurrency& Server::MaxConcurrencyOf(google::protobuf::Service* serv
 int Server::MaxConcurrencyOf(google::protobuf::Service* service,
                              const butil::StringPiece& method_name) const {
     return MaxConcurrencyOf(service->GetDescriptor()->full_name(), method_name);
+}
+
+bool& Server::IgnoreEovercrowdedOf(const butil::StringPiece& full_method_name) {
+    MethodProperty* mp = _method_map.seek(full_method_name);
+    if (mp == NULL) {
+        LOG(ERROR) << "Fail to find method=" << full_method_name;
+        _failed_to_set_ignore_eovercrowded = true;
+        return g_default_ignore_eovercrowded;
+    }
+    if (IsRunning()) {
+        LOG(WARNING) << "IgnoreEovercrowdedOf is only allowd before Server started";
+        return g_default_ignore_eovercrowded;
+    }
+    if (mp->status == NULL) {
+        LOG(ERROR) << "method=" << mp->method->full_name()
+                   << " does not support ignore_eovercrowded";
+        _failed_to_set_ignore_eovercrowded = true;
+        return g_default_ignore_eovercrowded;
+    }
+    return mp->ignore_eovercrowded;
+}
+
+bool Server::IgnoreEovercrowdedOf(const butil::StringPiece& full_method_name) const {
+    MethodProperty* mp = _method_map.seek(full_method_name);
+    if (IsRunning()) {
+        LOG(WARNING) << "IgnoreEovercrowdedOf is only allowd before Server started";
+        return g_default_ignore_eovercrowded;
+    }
+    if (mp == NULL || mp->status == NULL) {
+        return false;
+    }
+    return mp->ignore_eovercrowded;
 }
 
 bool Server::AcceptRequest(Controller* cntl) const {

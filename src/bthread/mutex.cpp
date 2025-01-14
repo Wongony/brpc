@@ -161,7 +161,9 @@ void ContentionProfiler::init_if_needed() {
     if (!_init) {
         // Already output nanoseconds, always set cycles/second to 1000000000.
         _disk_buf.append("--- contention\ncycles/second=1000000000\n");
-        CHECK_EQ(0, _dedup_map.init(1024, 60));
+        if (_dedup_map.init(1024, 60) != 0) {
+            LOG(WARNING) << "Fail to initialize dedup_map";
+        }
         _init = true;
     }
 }
@@ -658,7 +660,7 @@ void submit_contention(const bthread_contention_site_t& csite, int64_t now_ns) {
 }
 
 #if BRPC_DEBUG_LOCK
-#define MUTEX_RESET_OWNER_COMMON(owner)                                                     \
+#define MUTEX_RESET_OWNER_COMMON(owner)                                              \
     ((butil::atomic<bool>*)&(owner).hold)                                            \
         ->store(false, butil::memory_order_relaxed)
 
@@ -678,9 +680,9 @@ void submit_contention(const bthread_contention_site_t& csite, int64_t now_ns) {
                    << std::endl << trace.ToString();                                 \
     }
 #else
-#define MUTEX_RESET_OWNER_COMMON(owner) ((void)0)
-#define PTHREAD_MUTEX_SET_OWNER(owner) ((void)0)
-#define PTHREAD_MUTEX_CHECK_OWNER(owner) ((void)0)
+#define MUTEX_RESET_OWNER_COMMON(owner) ((void)owner)
+#define PTHREAD_MUTEX_SET_OWNER(owner) ((void)owner)
+#define PTHREAD_MUTEX_CHECK_OWNER(owner) ((void)owner)
 #endif // BRPC_DEBUG_LOCK
 
 namespace internal {

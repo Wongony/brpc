@@ -28,11 +28,24 @@
 #include "bthread/errno.h"
 
 #if defined(__cplusplus)
-#  include <iostream>
-#  include "bthread/mutex.h"        // use bthread_mutex_t in the RAII way
-#endif
+#include <iostream>
+#include "bthread/mutex.h"        // use bthread_mutex_t in the RAII way
+#endif // __cplusplus
 
 #include "bthread/id.h"
+
+#if defined(__cplusplus) && defined(BRPC_BTHREAD_TRACER)
+namespace bthread {
+// Assign a TaskMeta to the pthread and set the state to Running,
+// so that `stack_trace()' can trace the call stack of the pthread.
+bthread_t init_for_pthread_stack_trace();
+
+// Trace the call stack of the bthread, or pthread which has been
+// initialized by `init_for_pthread_stack_trace()'.
+void stack_trace(std::ostream& os, bthread_t tid);
+std::string stack_trace(bthread_t tid);
+} // namespace bthread
+#endif // __cplusplus && BRPC_BTHREAD_TRACER
 
 __BEGIN_DECLS
 
@@ -396,6 +409,24 @@ extern bthread_tag_t bthread_self_tag(void);
 // determine whether the associated initialisation routine has been called.
 // Returns 0 on success, error code otherwise.
 extern int bthread_once(bthread_once_t* once_control, void (*init_routine)());
+
+ /**
+ * @brief Retrieves the CPU time consumed by the current bthread.
+ *
+ * This function returns the CPU time (in nanoseconds) used by the current 
+ * bthread, excluding time spent in blocking I/O operations. The result 
+ * provides an accurate measure of CPU time utilized by the bthread's 
+ * execution.
+ *
+ * @note The functionality of this function depends on the 
+ *       `bthread_enable_cpu_clock_stat` flag. Ensure this flag is enabled 
+ *       for the function to provide meaningful results. If the flag is 
+ *       disabled, the function may return an invalid value or behave 
+ *       unexpectedly.
+ *
+ * @return int64_t The CPU time in nanoseconds consumed by the bthread.
+ */
+extern uint64_t bthread_cpu_clock_ns(void);
 
 __END_DECLS
 

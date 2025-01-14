@@ -25,11 +25,11 @@
 #include <iostream>                      // std::ostream
 #include <pthread.h>                     // pthread_mutex_t
 #include <algorithm>                     // std::max, std::min
-#include "butil/atomicops.h"              // butil::atomic
-#include "butil/macros.h"                 // BAIDU_CACHELINE_ALIGNMENT
-#include "butil/scoped_lock.h"            // BAIDU_SCOPED_LOCK
-#include "butil/thread_local.h"           // BAIDU_THREAD_LOCAL
-#include "butil/memory/manual_constructor.h"
+#include "butil/atomicops.h"             // butil::atomic
+#include "butil/macros.h"                // BAIDU_CACHELINE_ALIGNMENT
+#include "butil/scoped_lock.h"           // BAIDU_SCOPED_LOCK
+#include "butil/thread_local.h"          // BAIDU_THREAD_LOCAL
+#include "butil/memory/aligned_memory.h" // butil::AlignedMemory
 #include <vector>
 
 #ifdef BUTIL_OBJECT_POOL_NEED_FREE_ITEM_NUM
@@ -94,11 +94,12 @@ public:
     typedef ObjectPoolFreeChunk<T, FREE_CHUNK_NITEM>    FreeChunk;
     typedef ObjectPoolFreeChunk<T, 0> DynamicFreeChunk;
 
+    typedef AlignedMemory<sizeof(T), __alignof__(T)> BlockItem;
     // When a thread needs memory, it allocates a Block. To improve locality,
     // items in the Block are only used by the thread.
     // To support cache-aligned objects, align Block.items by cacheline.
     struct BAIDU_CACHELINE_ALIGNMENT Block {
-        ManualConstructor<T> items[BLOCK_NITEM];
+        BlockItem items[BLOCK_NITEM];
         size_t nitem;
 
         Block() : nitem(0) {}
@@ -146,7 +147,7 @@ public:
         // which may include parenthesis because when T is POD, "new T()"
         // and "new T" are different: former one sets all fields to 0 which
         // we don't want.
-#define BAIDU_OBJECT_POOL_GET(...)                                      \
+#define BAIDU_OBJECT_POOL_GET(CTOR_ARGS)                                \
         /* Fetch local free ptr */                                      \
         if (_cur_free.nfree) {                                          \
             BAIDU_OBJECT_POOL_FREE_ITEM_NUM_SUB1;                       \
@@ -160,12 +161,10 @@ public:
             return _cur_free.ptrs[--_cur_free.nfree];                   \
         }                                                               \
         T* obj = NULL;                                                  \
-        auto ctor = [&](void* mem) {                                    \
-            obj = new (mem) T(__VA_ARGS__);                             \
-        };                                                              \
         /* Fetch memory from local block */                             \
         if (_cur_block && _cur_block->nitem < BLOCK_NITEM) {            \
-            (_cur_block->items + _cur_block->nitem)->InitBy(ctor);      \
+            auto item = _cur_block->items + _cur_block->nitem;          \
+            obj = new (item->void_data()) T CTOR_ARGS;                  \
             if (!ObjectPoolValidator<T>::validate(obj)) {               \
                 obj->~T();                                              \
                 return NULL;                                            \
@@ -176,7 +175,8 @@ public:
         /* Fetch a Block from global */                                 \
         _cur_block = add_block(&_cur_block_index);                      \
         if (_cur_block != NULL) {                                       \
-            (_cur_block->items + _cur_block->nitem)->InitBy(ctor);      \
+            auto item = _cur_block->items + _cur_block->nitem;          \
+            obj = new (item->void_data()) T CTOR_ARGS;                  \
             if (!ObjectPoolValidator<T>::validate(obj)) {               \
                 obj->~T();                                              \
                 return NULL;                                            \
@@ -191,14 +191,9 @@ public:
             BAIDU_OBJECT_POOL_GET();
         }
 
-        template <typename A1>
-        inline T* get(const A1& a1) {
-            BAIDU_OBJECT_POOL_GET(a1);
-        }
-
-        template <typename A1, typename A2>
-        inline T* get(const A1& a1, const A2& a2) {
-            BAIDU_OBJECT_POOL_GET(a1, a2);
+        template<typename... Args>
+        inline T* get(Args&&... args) {
+            BAIDU_OBJECT_POOL_GET((std::forward<Args>(args)...));
         }
 
 #undef BAIDU_OBJECT_POOL_GET
@@ -240,28 +235,11 @@ public:
         return true;
     }
 
-    inline T* get_object() {
+    template <typename... Args>
+    inline T* get_object(Args&&... args) {
         LocalPool* lp = get_or_new_local_pool();
         if (BAIDU_LIKELY(lp != NULL)) {
-            return lp->get();
-        }
-        return NULL;
-    }
-
-    template <typename A1>
-    inline T* get_object(const A1& arg1) {
-        LocalPool* lp = get_or_new_local_pool();
-        if (BAIDU_LIKELY(lp != NULL)) {
-            return lp->get(arg1);
-        }
-        return NULL;
-    }
-
-    template <typename A1, typename A2>
-    inline T* get_object(const A1& arg1, const A2& arg2) {
-        LocalPool* lp = get_or_new_local_pool();
-        if (BAIDU_LIKELY(lp != NULL)) {
-            return lp->get(arg1, arg2);
+            return lp->get(std::forward<Args>(args)...);
         }
         return NULL;
     }
